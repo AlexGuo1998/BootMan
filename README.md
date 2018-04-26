@@ -1,2 +1,2 @@
 # BootMan
-(WIP) Bootloader of ArduMan, supports flashing from a SD card.
+(WIP) Bootloader of ArduMan, supports flashing from an SD card.
