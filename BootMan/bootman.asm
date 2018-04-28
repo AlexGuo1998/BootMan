@@ -37,16 +37,7 @@ bl:
 start_app:
 	jmp 0
 
-#define STACK_ALLOC_COUNT 35
-#define FS_STRUCT_SIZE 16;TODO
-; FS_STRUCT
-;#uint8_t FAT_type(in flags, T)
-;#uint8_t SecPerClus(in regs, r15)
-; uint32_t FATPos(when FAT starts?)
-; uint32_t EntryPos(or nowpos)
-; uint32_t Clus0Pos(when cluster #0(imagine) starts?)
-; uint32_t rootdirend(when root dir ends? only in FAT16)
-
+#define FS_STRUCT_SIZE 18
 ; flash a binary file
 ; uint8_t flash_file(char *filename);
 ; r25:r24 = (i)filename pointer(paddled SFN, ex: "FOLDER1    NEWGAME BIN\0")
@@ -59,57 +50,95 @@ flash_file:
 	push r24
 	rcall sdinit
 	sbrc r24, 7;r24 < 0x80 = OK
-	rjmp flash_file_error_1;else ret 0xFF
+	rjmp flash_file_error_1;else ret r24
+	lsr r24
+	;push r24
+	;push stack
+	ldi r20, FS_STRUCT_SIZE + 1
+flashfile_push:
+	in r23, SPH
+	in r22, SPL
+	push r24
+	dec r20
+	brne flashfile_push
+	;now, r23:r22 = stack_top + 1
+	rcall getfsinfo
+	sbrc r24, 0;r24 = 0 = OK
+	rjmp flash_file_error_2;else err, ret r24
 
-	in r18, SREG
-	cli;disable interrupt, for stack operation
-	push r18
+	;TODO findfile...
+	;TODO readfile and flash
 
+flash_file_error_2:
+	;TODO pop FS_STRUCT + 1 bytes
+flash_file_error_1:
+	pop r25;FN LOW
+	pop r25;FN HIGH
+	ret
+
+#define STACK_ALLOC_COUNT 35
+; uint8_t getfsinfo(uint8_t use_block_index, FSINFO *info)
+; r24     : (i)use_block_index? 1 : 0
+;           (o)OK? 0 : 1
+; ZH:ZL
+; XH:XL
+; r25
+; r21::r18
+; r23:r22 : (i)fsinfo addr
+; **********************************************************
+; FSINFO(18B)
+; uint32_t FATPos(when FAT starts?)
+; uint32_t EntryPos(or nowpos)
+; uint32_t Clus0Pos(when cluster #0(imagine) starts?)
+; uint32_t rootdirend(when root dir ends? only in FAT16)
+; uint8_t SecPerClus
+; uint8_t FAT_type(also in flags, T)
+getfsinfo:
 	;save regs
-	;push r0
 	push YH
 	push YL
 	push r17
 	push r16
-	push r15
 	push r14
-
-	mov r14, r24
-	lsr r14;now r14 = use_block_index ? 1 : 0
-
-	;raise stack(actually lower stack)
-	in r24, SPL
-	in r25, SPH
-	sbiw r25:r24, FS_STRUCT_SIZE
-	movw YH:YL, r25:r24
-	sbiw r25:r24, STACK_ALLOC_COUNT
-	out SPL, r24
-	out SPH, r25
-	adiw r25:r24, 1;move pointer in stack
+	;push r15;in following instructions
+	mov r14, r24;now r14 = use_block_index ? 1 : 0
+	movw YH:YL, r23:r22
+	;push stack
+	ldi r22, STACK_ALLOC_COUNT + 1
+getfsinfo_push:
+	in ZH, SPH
+	in ZL, SPL
+	push r15
+	dec r22
+	brne getfsinfo_push
+	;now, Z -> stack_top + 1
+	;r22 = 0
 
 	;0. read sect0[0], to test if it's raw FAT
-	clr r21;at this time, r23:r22:r21:r20 should be 0x00_00_02_00
-	movw r21:r20, r19:r18;start byte = 0
+	clr r23
+	;clr r22;already 0
+	movw r21:r20, r23:r22;sector addr = 0
+	movw r19:r18, r21:r20;start byte = 0
 	clr r17
-	ldi r16, 1
-	rcall sd_readsect
+	ldi r16, 1;byte_count = 1
+	rcall sd_readsect_use_Z
 	sbrc r24, 0;if r24 = 0 then OK
-	rjmp flash_file_error_2;else err
+	rjmp getfsinfo_err;else err
 	ld r18, -Z
 	andi r18, 0b11111101;for 0xEB/0xE9 test
 	cpi r18, 0b11101001
-	breq flash_file_raw_fat;if EQ, it's raw FAT
+	breq getfsinfo_raw_fat;if EQ, it's raw FAT
 
 	;1. read MBR, find sect_start
 	;start_sector = BOOTSECTOR[457::454]
-	;load r25:r24 = stack addr
+	;Z = &buffer[0]
 	ldi r18, LOW(454)
 	ldi r19, HIGH(454);start_byte = 454
-	;r17 = 0
+	;r17 should be 0
 	ldi r16, 4;byte_count = 4
-	rcall sd_readsect
+	rcall sd_readsect_use_Z;Z = &buffer[4]
 	sbrc r24, 0;if r24 = 0 then OK
-	rjmp flash_file_error_2;else err
+	rjmp getfsinfo_err;else err
 	;1st partition sector to r23::r20
 	ld r23, -Z
 	ld r22, -Z
@@ -118,17 +147,17 @@ flash_file:
 
 	;2. read BOOTSECTOR, get FAT type(FAT per sector 32/16), cluster size, cluster bondary,
 	;   FAT location, cluster 0 location, root dir pos, (FAT16) root dir size(?).
-flash_file_raw_fat:
+getfsinfo_raw_fat:
 	rcall st_Y_r20
-	movw r25:r24, ZH:ZL
+	;movw r25:r24, ZH:ZL
 	clr r19
 	ldi r18, 13
 	;r17 should be 0
 	ldi r16, 35
-	rcall sd_readsect
+	rcall sd_readsect_use_Z
 	;r22::r20 is INVALID
 	sbrc r24, 0;if r24 = 0 then OK
-	rjmp flash_file_error_2;else err
+	rjmp getfsinfo_err;else err
 	;now decode BOOTSECTOR
 	;Z pointer 35(+1) bytes away from stack_top
 	;reset Z
@@ -136,38 +165,40 @@ flash_file_raw_fat:
 	;Z = &BS[13]
 
 	;test FAT16/32
+	;T = 1 -> FAT32
 	clt;assume FAT16
-	;TODO: t=1 -> FAT32 or else?
 	ldd r15, Z+4;root_ent_count[0]
 	cp r15, r1;r1=0
 	ldd r15, Z+5;root_ent_count[1]
 	cpc r15, r1
-	brne flash_file_isFAT16 ;if root_ent_count(2B) != 0, then FAT16
+	brne getfsinfo_isFAT16 ;if root_ent_count(2B) != 0, then FAT16
 	set;else FAT32, T=1
 	;r23::r20 = FATSZ32
 	ldd r20, Z+36-13
 	ldd r21, Z+36-13+1
 	ldd r22, Z+36-13+2
 	ldd r23, Z+36-13+3
-flash_file_isFAT16:
+getfsinfo_isFAT16:
 
 	;SecPerClus
 	ld r15, Z;r15 = sect_per_clus
 	;fat loc (= base + RsvdSecCnt)
-	movw XH:XL, YH:YL
+	movw XH:XL, YH:YL;X is &struct[0](now contain start sector)
 	movw YH:YL, ZH:ZL
-	adiw YH:YL, 1;X is 1(+1)B off stack_top
+	adiw YH:YL, 1;Y is 1(+1)B off stack_top
 	;*(Y) += *(X)
 	clc
 	rcall add_XY_2
 	;Y is 3(+1)B off, X is 2B off struct
+	;save X back to Y
+	movw YH:YL, XH:XL
 
 	;EntryLoc (= fatloc + fatSZAll, for FAT16)
-	brts flash_file_ldfatsz_end;if fat32, fatsz already loaded
+	brts getfsinfo_ldfatsz_end;if fat32, fatsz already loaded
 	ldd r20, Z+22-13
 	ldd r21, Z+22-13+1
 	movw r23:r22, r25:r24;(=0)
-flash_file_ldfatsz_end:
+getfsinfo_ldfatsz_end:
 
 	;calc FatSZAll = fatsz * numfats
 	ldd r18, Z+16-13
@@ -181,8 +212,7 @@ flash_file_ldfatsz_end:
 	;for FAT32, fatcount = fatsize/4 = 0x00200000
 	;for minimum cluster size(512B, 1sect), min fs size = fatcount * 512 = 0x40000000 = 1TiB
 
-	movw YH:YL, ZH:ZL
-	adiw YH:YL, STACK_ALLOC_COUNT;YH:YL = FS_STRUCT
+	sbiw YH:YL, 2;YH:YL = FS_STRUCT(0)
 	rcall add_r20_Y;r23::r20 += fatloc
 	rcall st_Y_r20;r23::r20 -> Y(FS_STRUCT + 4)
 
@@ -190,10 +220,10 @@ flash_file_ldfatsz_end:
 	ldd r20, Z+17-13
 	ldd r21, Z+17-13+1
 	subi r20, -15
-	brcs flash_file_rootdir_c
+	brcs getfsinfo_rootdir_c
 	;if not carry then (+15) -> carry
 	inc r21
-flash_file_rootdir_c:
+getfsinfo_rootdir_c:
 	;r21:r20 >> 4
 	swap r21
 	swap r20
@@ -213,7 +243,7 @@ flash_file_rootdir_c:
 	lsl r20
 	;r20 MUST not overflow
 	;proof: cluster size must <= 32KB (64 sects), * 2 <= 128
-	;if should there be OVF, undim following line
+	;should there be OVF, undim following line
 	ser r21
 	;sbci r21, 0
 	ser r22
@@ -223,57 +253,41 @@ flash_file_rootdir_c:
 	rcall add_r20_Y
 	rcall st_Y_r20
 
+	std Y+4, r15;SecPerClus
+	bld r1, 0;r1 = 0 | T
+	std Y+5, r1;Fat32? 1 : 0
 	;adjust entry for FAT32
-	brtc flash_file_loopdir
+	brtc getfsinfo_done
 	ldd r20, Z+44-13
 	ldd r21, Z+44-13+1
 	ldd r22, Z+44-13+2
 	ldd r23, Z+44-13+3
-	mov r18, r20;SectPerClus
+	mov r18, r15;SectPerClus
 	ldi XL, 20
 	;XH = 0, for add_r20_Y
-	rcall mul_X_4
+	rcall mul_X_4;r25=0
 	ldi XL, 20
 	;now Y -> cls0sec
 	rcall add_XY_4
 	sbiw Y, 12;now Y -> entryPos
 	rcall st_Y_r20
 
-	/*
-	LAST STACK
-	FS_STRUCT(16)
-		FATPos
-		entry
-		rootdirend
-		Clus0Pos
-	BOOTSECTOR(35)
-	STACK_TOP
-	*/
-	;3. loop through dir
-flash_file_loopdir:
-	;4. Flash
-	;5. end
-flash_file_error_2:
+getfsinfo_done:
+	clr r24;r24=0,OK
+getfsinfo_err:
 	;reset stack
-	in r24, SPL
-	in r25, SPH
-	adiw r25:r24, STACK_ALLOC_COUNT + FS_STRUCT_SIZE
-	out SPL, r24
-	out SPH, r25
-
-	pop r14
+	ldi r16, STACK_ALLOC_COUNT + 1
+getfsinfo_pop:
 	pop r15
+	dec r16
+	brne getfsinfo_pop
+	;at last, r15 = real r15
+	pop r14
 	pop r16
 	pop r17
 	pop YL
 	pop YH
 	clr r1
-	;pop r0
-	pop r25
-	out SREG, r25
-flash_file_error_1:
-	pop r25;FN LOW
-	pop r25;FN HIGH
 	ret
 
 .def temp1 = r19
@@ -305,23 +319,27 @@ st_Y_r20:
 
 ; *X = *X * r18, r25 = carry
 ; r0, r1, r24 used
+.def temp = r24
+.def carry = r25
 mul_X_4:
 	rcall mul_X_2
 mul_X_2:
 	rcall mul_X_1
 mul_X_1:
 	ld r24, X
-	mul r18, r24
-	add r0, r25
-	movw r25:r24, r1:r0
-	st X+, r24
+	mul r18, temp
+	add r0, carry
+	movw carry:temp, r1:r0
+	st X+, temp
 	ret
+.undef temp
+.undef carry
 
 ; init SD card
 ; uint8_t sdinit(void)
-; r24            = (o)cardmode (0=SD1, 1=SD2, 2=SDHC/SDXC(block index), 0xFF=failed)
-; r18~r23 r26~27 = (o)
-; T(flag)        = (o)0=SD1, 1=SD2/SDHC/SDXC
+; r24            : (o)cardmode (0=SD1, 1=SD2, 2=SDHC/SDXC(block index), 0xFF=failed)
+; r18~r23 r26~27 : (o)
+; T(flag)        : (o)0=SD1, 1=SD2/SDHC/SDXC
 ; assert: r1 = 0
 sdinit:
 	ser r24;assume ret = 0xFF
@@ -398,7 +416,7 @@ acmd41_loop:
 	rcall spi_trans
 	;if ret = 0b1xxxxxxx then failed
 	sbrs r19, 7
-	rjmp sdinit_end;TODO ret?
+	rjmp sdinit_end;TODO direct ret?
 	inc r24;r24=0
 	;now r19.6 = 1 -> block index
 	sbrc r19, 6
@@ -422,7 +440,7 @@ sdinit_end:
 ; r25             : (o)0 if OK, else UNDEF
 ;     r24         : (o)OK ? 0 : 1
 ; r23:r22:r21:r20 : (i)sector
-;                 : (o)sector or byte address
+;                   (o)sector or byte address
 ; r19:r18         : (i)start byte(moved to r27:r26)
 ; r19             : (o)out crc(last byte)
 ;     r18         : (o)0xFF
@@ -430,6 +448,7 @@ sdinit_end:
 ; r14             : (i)use_block_addr ? xxxxxxx1 : xxxxxxx0 (not use -> addr must * 512)
 sd_readsect:
 	movw ZH:ZL, r25:r24
+sd_readsect_use_Z:
 	movw r27:r26, r19:r18
 	sbrs r14, 0;if use_blk_addr then * 512
 	rjmp sd_readsect_send;else skip
