@@ -12,6 +12,7 @@
 #define sdcmd(x) ((x) | 0x40)
 
 .org BL_START
+/*
 	jmp bl
 
 .org VECTOR_START
@@ -22,6 +23,7 @@ entry_flash_page:
 	jmp flash_page
 entry_sdinit:
 	jmp sdinit
+*/
 
 ;normal boot sequence
 bl:
@@ -35,26 +37,291 @@ bl:
 start_app:
 	jmp 0
 
+#define STACK_ALLOC_COUNT 35
+#define FS_STRUCT_SIZE 16;TODO
+; FS_STRUCT
+;#uint8_t FAT_type(in flags, T)
+;#uint8_t SecPerClus(in regs, r15)
+; uint32_t FATPos(when FAT starts?)
+; uint32_t EntryPos(or nowpos)
+; uint32_t Clus0Pos(when cluster #0(imagine) starts?)
+; uint32_t rootdirend(when root dir ends? only in FAT16)
+
 ; flash a binary file
 ; uint8_t flash_file(char *filename);
-; r25:r24 = filename pointer(paddled SFN, ex: "FOLDER1    NEWGAME BIN\0")
-;     r24 = (output)errnumber (when OK, there's no return)
+; r25:r24 = (i)filename pointer(paddled SFN, ex: "FOLDER1    NEWGAME BIN\0")
+;     r24 = (o)errnumber (when OK, there's no return)
+; TODO: more regs used...
 flash_file:
 	;don't do test for illegal filename(or length), to save code
-	;beacuse illegal filename fill fail when going through dirs
+	;beacuse illegal filename will fail when going through dirs
 	push r25
 	push r24
 	rcall sdinit
+	sbrc r24, 7;r24 < 0x80 = OK
+	rjmp flash_file_error_1;else ret 0xFF
 
+	in r18, SREG
+	cli;disable interrupt, for stack operation
+	push r18
+
+	;save regs
+	;push r0
+	push YH
+	push YL
+	push r17
+	push r16
+	push r15
+	push r14
+
+	mov r14, r24
+	lsr r14;now r14 = use_block_index ? 1 : 0
+
+	;raise stack(actually lower stack)
+	in r24, SPL
+	in r25, SPH
+	sbiw r25:r24, FS_STRUCT_SIZE
+	movw YH:YL, r25:r24
+	sbiw r25:r24, STACK_ALLOC_COUNT
+	out SPL, r24
+	out SPH, r25
+	adiw r25:r24, 1;move pointer in stack
+
+	;0. read sect0[0], to test if it's raw FAT
+	clr r21;at this time, r23:r22:r21:r20 should be 0x00_00_02_00
+	movw r21:r20, r19:r18;start byte = 0
+	clr r17
+	ldi r16, 1
+	rcall sd_readsect
+	sbrc r24, 0;if r24 = 0 then OK
+	rjmp flash_file_error_2;else err
+	ld r18, -Z
+	andi r18, 0b11111101;for 0xEB/0xE9 test
+	cpi r18, 0b11101001
+	breq flash_file_raw_fat;if EQ, it's raw FAT
+
+	;1. read MBR, find sect_start
+	;start_sector = BOOTSECTOR[457::454]
+	;load r25:r24 = stack addr
+	ldi r18, LOW(454)
+	ldi r19, HIGH(454);start_byte = 454
+	;r17 = 0
+	ldi r16, 4;byte_count = 4
+	rcall sd_readsect
+	sbrc r24, 0;if r24 = 0 then OK
+	rjmp flash_file_error_2;else err
+	;1st partition sector to r23::r20
+	ld r23, -Z
+	ld r22, -Z
+	ld r21, -Z
+	ld r20, -Z
+
+	;2. read BOOTSECTOR, get FAT type(FAT per sector 32/16), cluster size, cluster bondary,
+	;   FAT location, cluster 0 location, root dir pos, (FAT16) root dir size(?).
+flash_file_raw_fat:
+	rcall st_Y_r20
+	movw r25:r24, ZH:ZL
+	clr r19
+	ldi r18, 13
+	;r17 should be 0
+	ldi r16, 35
+	rcall sd_readsect
+	;r22::r20 is INVALID
+	sbrc r24, 0;if r24 = 0 then OK
+	rjmp flash_file_error_2;else err
+	;now decode BOOTSECTOR
+	;Z pointer 35(+1) bytes away from stack_top
+	;reset Z
+	sbiw ZH:ZL, 35
+	;Z = &BS[13]
+
+	;test FAT16/32
+	clt;assume FAT16
+	;TODO: t=1 -> FAT32 or else?
+	ldd r15, Z+4;root_ent_count[0]
+	cp r15, r1;r1=0
+	ldd r15, Z+5;root_ent_count[1]
+	cpc r15, r1
+	brne flash_file_isFAT16 ;if root_ent_count(2B) != 0, then FAT16
+	set;else FAT32, T=1
+	;r23::r20 = FATSZ32
+	ldd r20, Z+36-13
+	ldd r21, Z+36-13+1
+	ldd r22, Z+36-13+2
+	ldd r23, Z+36-13+3
+flash_file_isFAT16:
+
+	;SecPerClus
+	ld r15, Z;r15 = sect_per_clus
+	;fat loc (= base + RsvdSecCnt)
+	movw XH:XL, YH:YL
+	movw YH:YL, ZH:ZL
+	adiw YH:YL, 1;X is 1(+1)B off stack_top
+	;*(Y) += *(X)
+	clc
+	rcall add_XY_2
+	;Y is 3(+1)B off, X is 2B off struct
+
+	;EntryLoc (= fatloc + fatSZAll, for FAT16)
+	brts flash_file_ldfatsz_end;if fat32, fatsz already loaded
+	ldd r20, Z+22-13
+	ldd r21, Z+22-13+1
+	movw r23:r22, r25:r24;(=0)
+flash_file_ldfatsz_end:
+
+	;calc FatSZAll = fatsz * numfats
+	ldd r18, Z+16-13
+	ldi XL, 20
+	clr XH
+	;X -> r20
+	rcall mul_X_4;(r25(carry) = 0)
+	;***IMPORTANT*** for wrong cards, r1 can be other than 0
+	;r24 MUST equ 0 (for card size < 1TB)
+	;proof: if r24 = 1(total size = 0x01000000), for numfats = 2(typical), fatsize = 0x00800000
+	;for FAT32, fatcount = fatsize/4 = 0x00200000
+	;for minimum cluster size(512B, 1sect), min fs size = fatcount * 512 = 0x40000000 = 1TiB
+
+	movw YH:YL, ZH:ZL
+	adiw YH:YL, STACK_ALLOC_COUNT;YH:YL = FS_STRUCT
+	rcall add_r20_Y;r23::r20 += fatloc
+	rcall st_Y_r20;r23::r20 -> Y(FS_STRUCT + 4)
+
+	;RootSirSz -> r23::r20
+	ldd r20, Z+17-13
+	ldd r21, Z+17-13+1
+	subi r20, -15
+	brcs flash_file_rootdir_c
+	;if not carry then (+15) -> carry
+	inc r21
+flash_file_rootdir_c:
+	;r21:r20 >> 4
+	swap r21
+	swap r20
+	mov r22, r21
+	andi r22, 0xF0
+	andi r21, 0x0F
+	andi r20, 0x0F
+	or r20, r22
+	movw r23:r22, r25:r24;must be 0(refer to proof above)
+
+	;RootDirEndLoc = EntryLoc + RootDirSz
+	rcall add_r20_Y
+	rcall st_Y_r20
+
+	;calc 2 * SectPerClus
+	mov r20, r15
+	lsl r20
+	;r20 MUST not overflow
+	;proof: cluster size must <= 32KB (64 sects), * 2 <= 128
+	;if should there be OVF, undim following line
+	ser r21
+	;sbci r21, 0
+	ser r22
+	ser r23
+	neg r20
+	;cls0sec = RootDirEndLoc - (2 * SecPerClus)
+	rcall add_r20_Y
+	rcall st_Y_r20
+
+	;adjust entry for FAT32
+	brtc flash_file_loopdir
+	ldd r20, Z+44-13
+	ldd r21, Z+44-13+1
+	ldd r22, Z+44-13+2
+	ldd r23, Z+44-13+3
+	mov r18, r20;SectPerClus
+	ldi XL, 20
+	;XH = 0, for add_r20_Y
+	rcall mul_X_4
+	ldi XL, 20
+	;now Y -> cls0sec
+	rcall add_XY_4
+	sbiw Y, 12;now Y -> entryPos
+	rcall st_Y_r20
+
+	/*
+	LAST STACK
+	FS_STRUCT(16)
+		FATPos
+		entry
+		rootdirend
+		Clus0Pos
+	BOOTSECTOR(35)
+	STACK_TOP
+	*/
+	;3. loop through dir
+flash_file_loopdir:
+	;4. Flash
+	;5. end
+flash_file_error_2:
+	;reset stack
+	in r24, SPL
+	in r25, SPH
+	adiw r25:r24, STACK_ALLOC_COUNT + FS_STRUCT_SIZE
+	out SPL, r24
+	out SPH, r25
+
+	pop r14
+	pop r15
+	pop r16
+	pop r17
+	pop YL
+	pop YH
+	clr r1
+	;pop r0
+	pop r25
+	out SREG, r25
+flash_file_error_1:
+	pop r25;FN LOW
+	pop r25;FN HIGH
 	ret
 
+.def temp1 = r19
+.def temp2 = r18
+add_r20_Y:
+	ldi XL, 20
+	clr XH
+; *Y = *Y + *X (4B)
+add_XY_4:
+	clc
+	rcall add_XY_2
+add_XY_2:
+	rcall add_XY_1;4x loop
+add_XY_1:
+	ld temp1, X
+	ld temp2, Y+
+	adc temp1, temp2
+	st X+, temp1
+	ret
+.undef temp1
+.undef temp2
 
+st_Y_r20:
+	std Y+0, r20
+	std Y+1, r21
+	std Y+2, r22
+	std Y+3, r23
+	ret
+
+; *X = *X * r18, r25 = carry
+; r0, r1, r24 used
+mul_X_4:
+	rcall mul_X_2
+mul_X_2:
+	rcall mul_X_1
+mul_X_1:
+	ld r24, X
+	mul r18, r24
+	add r0, r25
+	movw r25:r24, r1:r0
+	st X+, r24
+	ret
 
 ; init SD card
 ; uint8_t sdinit(void)
-; r24            = (output) cardmode (0=SD1, 1=SD2, 2=SDHC/SDXC(block index), 0xFF=failed)
-; r18~r23 r26~27 = (used)
-; T(flag)        = (used) 0=SD1, 1=SD2/SDHC/SDXC
+; r24            = (o)cardmode (0=SD1, 1=SD2, 2=SDHC/SDXC(block index), 0xFF=failed)
+; r18~r23 r26~27 = (o)
+; T(flag)        = (o)0=SD1, 1=SD2/SDHC/SDXC
 ; assert: r1 = 0
 sdinit:
 	ser r24;assume ret = 0xFF
@@ -144,23 +411,28 @@ cmd16:
 	ldi r18, sdcmd(16);cmd = 0x16
 	ldi r21, 0x02;arg=0x200
 	rcall sd_cmd
-	
+
 sdinit_end:
 	ret
 
 
-; bool sd_readsect(uint8_t *buffer, uint32_t sect_index, uint16_t start_byte, uint16_t count, uint8_t block_address)
-; r25:r24         = pointer to buffer(moved to ZH:ZL)
-;     r24         = (output) OK ? 1 : 0
-; r23:r22:r21:r20 = sector
-; r19:r18         = start byte(moved to r27:r26)
-; r17:r16         = byte count
-; r14             = use_block_addr ? 1 : 0 (not use -> addr must * 512)
+; uint8_t sd_readsect(uint8_t *buffer, uint32_t sect_index, uint16_t start_byte, uint16_t count, uint8_t block_address)
+; ZH:ZL           : (o)pointer to buffer(final)
+; r25:r24         : (i)pointer to buffer(moved to ZH:ZL)
+; r25             : (o)0 if OK, else UNDEF
+;     r24         : (o)OK ? 0 : 1
+; r23:r22:r21:r20 : (i)sector
+;                 : (o)sector or byte address
+; r19:r18         : (i)start byte(moved to r27:r26)
+; r19             : (o)out crc(last byte)
+;     r18         : (o)0xFF
+; r17:r16         : (i)byte count
+; r14             : (i)use_block_addr ? xxxxxxx1 : xxxxxxx0 (not use -> addr must * 512)
 sd_readsect:
 	movw ZH:ZL, r25:r24
 	movw r27:r26, r19:r18
 	sbrs r14, 0;if use_blk_addr then * 512
-	jmp sd_readsect_send;else skip
+	rjmp sd_readsect_send;else skip
 	clc
 	rol r20
 	rol r21
@@ -174,20 +446,19 @@ sd_readsect_send:
 	rcall sd_cmd;arg = address
 	cpi r19, 0;r19 = 0?
 	breq sd_readsect_cmd_ok;0 = OK
-	;else return 0
-ret_0:
-	clr r24
-	ret
+	;else return 1
+	rjmp ret_1
 sd_readsect_cmd_ok:
 	rcall spi_trans
 	inc r1
-	breq ret_0;r1 = 0(256), fail(timeout)
+	breq ret_1_1;r1 = 0(256), fail(timeout)
 	sbrc r19, 0;if bit0 = 0 then OK
 	rjmp sd_readsect_cmd_ok
 	;OK
 	clr r1;reset r1
 	sbrs r19, 7;if bit7 = 1 then OK
-	rjmp ret_0;else fail
+ret_1_1:
+	rjmp ret_1;else fail
 
 	;calc remaining byte, save to r25:r24
 	ldi r25, 0x02
@@ -215,8 +486,11 @@ sd_readsect_drop_2:
 	rcall spi_trans
 	sbiw r25:r24, 1
 	brne sd_readsect_drop_2
-	;done, ret 1
-	rjmp ret_1
+	;done, ret 0
+ret_0:
+	clr r24
+	ret
+
 
 ; assert r18 = 0xFF
 ; assert r1 = 0
@@ -226,11 +500,11 @@ send_256_dummy_bytes:
 	brne send_256_dummy_bytes;eq(zero) = overflow
 	ret
 
-; r18             : cmd(must use sdcmd(x)!)
-;                   (used) return 0xFF
-; r19             : (output)return value(can be 0xFF for failed)
-; r23:r22:r21:r20 : arg
-; r24             : (used) crc
+; r24             : (o)crc(junk)
+; r23:r22:r21:r20 : (i)arg
+; r19             : (o)return value(can be 0xFF for failed)
+; r18             : (i)cmd(must use sdcmd(x)!)
+;                   (o)0xFF
 ; assert: r1 = 0
 sd_cmd:
 	;load CRC
@@ -261,8 +535,8 @@ sd_cmd_fail:
 	ret
 
 ; transfer a byte
-; r18 : data
-; r19 : (output) data_out
+; r19 : (o)data_out
+; r18 : (i)data
 spi_trans:
 	out SPDR, r18
 spi_trans_wait:
@@ -274,13 +548,15 @@ spi_trans_wait:
 
 ; flash a page(64 words/128 bytes) from RAM
 ; bool flash_page(const uint8_t data[128], uint16_t addr)
-; r18     : (used) sreg
-; r19     : (used) 0(?)
-; r23:r22 : address (low 7 bits are ignored)
-; r25:r24 : data pointer
-; r25     : (used) 0
-;     r24 : (output) OK?1:0
-; ZH:ZL   : (used) address
+; ZH:ZL   : (o)page address
+; r25:r24 : (i)data pointer
+; r25     : (o)0
+;     r24 : (o)OK?1:0
+; r23:r22 : (i)address (low 7 bits are ignored)
+; r19     : (o)0(?)
+; r18     : (o)sreg
+; r1      : (o)0(always 0)
+; r0      : (o)last low_byte(junk)
 flash_page:
 	;preserve BL section (addr >= BL_START -> ret false)
 	cpi r23, HIGH(BL_START)
@@ -290,11 +566,12 @@ flash_page:
 check_ok:
 .def temp = r18
 	;save SREG and disable interrupt
+	;TODO use a temp reg to save SREG to avoid PUSH/POP?
 	in temp, SREG
 	cli
 	push temp
 	;save r0 (r1 is always 0)
-	push r0
+	;push r0
 	;wait for eeprom write
 wait_eeprom:
 	sbic EECR, EEPE
@@ -325,7 +602,7 @@ load_buffer:
 	rcall do_spm
 
 	;done, restore
-	pop r0
+	;pop r0
 	clr r1
 	pop temp
 	out SREG, temp
