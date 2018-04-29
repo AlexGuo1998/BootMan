@@ -63,6 +63,10 @@ flashfile_push:
 	brne flashfile_push
 	;now, r23:r22 = stack_top + 1
 	rcall getfsinfo
+	;STACK:
+	;filename H:L
+	;useblock?
+	;FS_STRUCT(18)
 	sbrc r24, 0;r24 = 0 = OK
 	rjmp flash_file_error_2;else err, ret r24
 
@@ -87,12 +91,12 @@ flash_file_error_1:
 ; r23:r22 : (i)fsinfo addr
 ; **********************************************************
 ; FSINFO(18B)
-; uint32_t FATPos(when FAT starts?)
-; uint32_t EntryPos(or nowpos)
-; uint32_t Clus0Pos(when cluster #0(imagine) starts?)
-; uint32_t rootdirend(when root dir ends? only in FAT16)
-; uint8_t SecPerClus
-; uint8_t FAT_type(also in flags, T)
+; 0  uint32_t FATPos(when FAT starts?)
+; 4  uint32_t EntryPos
+; 8  uint32_t Clus0Pos(when cluster #0(imagine) starts?)
+; 12 uint32_t rootdirend(when root dir ends? only in FAT16)
+; 16 uint8_t SecPerClus
+; 17 uint8_t FAT_type, FAT32 = 1(also in flags, T)
 getfsinfo:
 	;save regs
 	push YH
@@ -166,19 +170,18 @@ getfsinfo_raw_fat:
 
 	;test FAT16/32
 	;T = 1 -> FAT32
-	clt;assume FAT16
+	set;assume FAT32
 	ldd r15, Z+4;root_ent_count[0]
 	cp r15, r1;r1=0
 	ldd r15, Z+5;root_ent_count[1]
-	cpc r15, r1
-	brne getfsinfo_isFAT16 ;if root_ent_count(2B) != 0, then FAT16
-	set;else FAT32, T=1
+	cpse r15, r1;if root_ent_cnt = r1 (= 0) then skip
+	clt;else, root_ent_count != 0, FAT16, T = 0
+	;try to load FATSZ32, if FAT16, fatsz(r23::r20) will be overwrittern later
 	;r23::r20 = FATSZ32
 	ldd r20, Z+36-13
 	ldd r21, Z+36-13+1
 	ldd r22, Z+36-13+2
 	ldd r23, Z+36-13+3
-getfsinfo_isFAT16:
 
 	;SecPerClus
 	ld r15, Z;r15 = sect_per_clus
@@ -195,6 +198,7 @@ getfsinfo_isFAT16:
 
 	;EntryLoc (= fatloc + fatSZAll, for FAT16)
 	brts getfsinfo_ldfatsz_end;if fat32, fatsz already loaded
+	;else overwrite fatsz(r23::r21)
 	ldd r20, Z+22-13
 	ldd r21, Z+22-13+1
 	movw r23:r22, r25:r24;(=0)
@@ -386,7 +390,7 @@ sdinit:
 	rcall sd_cmd
 	;if ret = 0b1xxxxxxx then failed
 	sbrs r19, 7
-	rjmp sdinit_end;TODO ret?
+	rjmp sdinit_end;TODO direct ret?
 	;if ret = 0b0xxxx1xx then sdver1
 	sbrs r19, 2
 	set;else SD2, T=true
@@ -446,6 +450,8 @@ sdinit_end:
 ;     r18         : (o)0xFF
 ; r17:r16         : (i)byte count
 ; r14             : (i)use_block_addr ? xxxxxxx1 : xxxxxxx0 (not use -> addr must * 512)
+; r1              : (i)0 (if r1 != 0, false timeout can happen)
+;                   (o)0
 sd_readsect:
 	movw ZH:ZL, r25:r24
 sd_readsect_use_Z:
@@ -463,16 +469,14 @@ sd_readsect_use_Z:
 sd_readsect_send:
 	ldi r18, sdcmd(17);CMD17
 	rcall sd_cmd;arg = address
-	cpi r19, 0;r19 = 0?
-	breq sd_readsect_cmd_ok;0 = OK
-	;else return 1
-	rjmp ret_1
-sd_readsect_cmd_ok:
+	cpse r19, r1;if r19(ret) = r1 (= 0) then skip
+	rjmp ret_1;else ret 1
+sd_readsect_cmd_loop:
 	rcall spi_trans
 	inc r1
 	breq ret_1_1;r1 = 0(256), fail(timeout)
 	sbrc r19, 0;if bit0 = 0 then OK
-	rjmp sd_readsect_cmd_ok
+	rjmp sd_readsect_cmd_loop
 	;OK
 	clr r1;reset r1
 	sbrs r19, 7;if bit7 = 1 then OK
