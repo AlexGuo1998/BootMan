@@ -946,8 +946,8 @@ getnextsect_lsl_loop:
 ; flash a page(64 words/128 bytes) from RAM
 ; bool flash_page(const uint8_t data[128], uint16_t addr)
 ; ZH:ZL   : (o)page address
+; XH:XL   : (o)data pointer + 128
 ; r25:r24 : (i)data pointer
-; r25     : (o)0
 ;     r24 : (o)OK?1:0
 ; r23:r22 : (i)address (low 7 bits are ignored)
 ; r19     : (o)0(?)
@@ -957,48 +957,48 @@ getnextsect_lsl_loop:
 flash_page:
 	;preserve BL section (addr >= BL_START -> ret false)
 	cpi r23, HIGH(BL_START)
-	brlo check_ok;if HIGH(addr) < HIGH(bootloader) then OK
+	brlo flashpage_checkok;if HIGH(addr) < HIGH(bootloader) then OK
 	;else: return false
 	rjmp ret_0
-check_ok:
+flashpage_checkok:
 .def temp = r18
+	;mov data pointer to X
+	movw XH:XL, r25:r24
+	movw ZH:ZL, r23:r22
+flashpage_use_XZ_as_pointer:
+	;lower Z = 0, for writing
+	andi ZL, 0b1000_0000
 	;save SREG and disable interrupt
 	;TODO use a temp reg to save SREG to avoid PUSH/POP?
 	in temp, SREG
 	cli
 	push temp
-	;save r0 (r1 is always 0)
-	;push r0
 	;wait for eeprom write
-wait_eeprom:
+flashpage_wait_eeprom:
 	sbic EECR, EEPE
-	rjmp wait_eeprom
+	rjmp flashpage_wait_eeprom
 	;erase page
-	movw ZH:ZL, r23:r22
 	ldi temp, (1<<SPMEN) | (1<<PGERS)
 	rcall do_spm
-	;mov data pointer to Z
-	movw ZH:ZL, r25:r24
-	;r25=128, for store loop
-	ldi r25, 128
+	ldi r25, 64;64 words
 	;load page buffer
 	ldi temp, (1<<SPMEN)
-load_buffer:
-	ld r0, Z+
-	ld r1, Z+
+flashpage_fill_buffer:
+	ld r0, X+
+	ld r1, X+
 	rcall do_spm
-	inc r25
-	brne load_buffer;if r25 != 0(256) (ne) then loop
+	subi ZL, -2;ZL += 2
+	dec r25
+	brne flashpage_fill_buffer;if r25 != 0 then loop
 	;else: all data (128b) loaded to buffer
+	subi ZL, 128;reset ZL
 	;write page
-	movw ZH:ZL, r23:r22
 	ldi temp, (1<<SPMEN) | (1<<PGWRT)
 	rcall do_spm
 	;re-enable access to RWW section
 	ldi temp, (1<<SPMEN) | (1<<RWWSRE)
 	rcall do_spm
 	;done, restore
-	;pop r0
 	clr r1
 	pop temp
 	out SREG, temp
