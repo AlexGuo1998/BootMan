@@ -123,8 +123,8 @@ flash_file_error_1:
 ; FSINFO(18B)
 ; 0  uint32_t FATPos(when FAT starts?)
 ; 4  uint32_t EntryPos
-; 8  uint32_t Clus0Pos(when cluster #0(imagine) starts?)
-; 12 uint32_t rootdirend(when root dir ends? only in FAT16)
+; 8  uint32_t rootdirend(when root dir ends? only in FAT16)
+; 12 uint32_t Clus0Pos(when cluster #0(imagine) starts?)
 ; 16 uint8_t SecPerClus
 ; 17 uint8_t FAT_type, FAT32 = 1(also in flags, T)
 getfsinfo:
@@ -413,6 +413,11 @@ findfile_push:
 	ldd r11, Y+5
 	ldd r12, Y+6
 	ldd r13, Y+7
+	;load r9(SectPerClus - 1), r8(ClusBondary)
+	ldd r9, Y+16
+	dec r9
+	ldd r8, Y+12;Clus0Pos low
+	and r8, r9;mask high bits
 	movw YH:YL, r25:r24;Y -> filename
 	;r17:r16 = 32(0x20)(read 32 bytes)
 	clr r17;TODO reload r17?
@@ -442,7 +447,7 @@ findfile_readentry:
 	brne findfile_nextfile;if not EQ, find next
 	;else found
 	;check file_attr
-	ldd r19, Z+0;r19 = attr
+	ld r19, Z;r19 = attr
 	sbrc r19, 3;if attr & 0x08(is volume lbl) = 0 then skip
 	rjmp findfile_nextfile;else skip
 	ld r18, Y;filename[11]
@@ -471,6 +476,7 @@ findfile_found:
 	movw YH:YL, r7:r6
 	;clr r15;go from first item
 	;(already done)
+	ld r18, Y;filename[11]
 	cpi r18, 0
 	brne findfile_newsect;filename not done then loop
 	rjmp findfile_done;done, jmp
@@ -501,12 +507,12 @@ findfile_nextfile:
 	rjmp findfile_reloadcount
 
 findfile_err:
-	clr r23
-	clr r22
-	movw r21:r20, r23:r22;all 0
+	clr r13
+	clr r12
+	movw r11:r10, r13:r12;all 0
 findfile_done:
-	movw r19:r18, r21:r20
-	movw r21:r20, r23:r22
+	movw r21:r20, r13:r12
+	movw r19:r18, r11:r10
 	ldd r22, Z+28+0
 	ldd r23, Z+28+1
 	ldd r24, Z+28+2
@@ -523,7 +529,7 @@ findfile_pop_1:
 findfile_pop_2:
 	pop r0
 	st Z+, r0
-	cpi ZL, 19
+	cpi ZL, 18
 	brne findfile_pop_2
 	pop r0
 	pop r0
@@ -601,6 +607,12 @@ sdinit:
 	sbi SS_DDR, SS_BIT
 	;set MISO to pullup
 	sbi PORTB, PORTB3
+
+	;set CLK to output
+	sbi DDRB, PORTB1
+	;set MOSI to output
+	sbi DDRB, PORTB2
+
 	;deselect screen
 	sbi SCRCS_PORT, SCRCS_BIT
 	sbi SCRCS_DDR, SCRCS_BIT
@@ -610,9 +622,9 @@ sdinit:
 	;enable SPI, set master
 	ldi r18, (1<<SPE) | (1<<MSTR)
 	out SPCR, r18
-	;enable 2x
-	ldi r18, (1<<SPI2X)
-	out SPSR, r18
+	;TODO enable 2x?
+	;ldi r18, (1<<SPI2X)
+	out SPSR, r1
 
 	;1.set cs high, then apply 74+(10B+) dummy clocks
 	ser r18
@@ -637,7 +649,7 @@ sdinit:
 	ldi r21, 0x01
 	rcall sd_cmd
 	;if ret = 0b1xxxxxxx then failed
-	sbrs r19, 7
+	sbrc r19, 7
 	rjmp sdinit_end;TODO direct ret?
 	;if ret = 0b0xxxx1xx then sdver1
 	sbrs r19, 2
@@ -646,7 +658,7 @@ sdinit:
 	;4.issue CMD55+41, init(timeout 1s)
 	movw r21:r20, r23:r22;arg(1,2)=0
 	;movw r27:r26, r23:r22;delay counter = 0
-	ldi r27, 0b1100_0000;TODO: 16129+ cycles(4s)
+	ldi r27, 16;1048576+ Bytes @4MHz(3s+)
 acmd41_loop:
 	rcall send_256_dummy_bytes ;drop cmd8 remaining bytes, also delay
 	ldi r18, sdcmd(55)
@@ -656,20 +668,20 @@ acmd41_loop:
 	bld r23, 6;if SD2(T=1), arg = 0x4000_0000, else arg = 0
 	rcall sd_cmd
 	;test counter overflow
-	adiw r27:r26, 1
-	breq sdinit_end;65536 = fail
-	sbrc r19, 1;if ret = 0x00(card ready) then exit loop
+	sbiw r27:r26, 1
+	breq sdinit_end;0 = fail
+	sbrc r19, 0;if ret = 0x00(card ready) then exit loop
 	rjmp acmd41_loop;loop
 
 	;5.if SDV2, issue CMD58, to know if card is HCS(use sector for addressing)
 	brtc cmd16;sdv1 -> skip
 	ldi r18, sdcmd(58)
 	rcall sd_cmd
-	rcall spi_trans
 	;if ret = 0b1xxxxxxx then failed
-	sbrs r19, 7
+	sbrc r19, 7
 	rjmp sdinit_end;TODO direct ret?
 	inc r24;r24=0
+	rcall spi_trans
 	;now r19.6 = 1 -> block index
 	sbrc r19, 6
 	inc r24;r24=0/1
@@ -679,6 +691,7 @@ acmd41_loop:
 cmd16:
 	inc r24;r24=0/1/2
 	ldi r18, sdcmd(16);cmd = 0x16
+	clr r23
 	ldi r21, 0x02;arg=0x200
 	rcall sd_cmd
 
@@ -695,7 +708,7 @@ send_256_dummy_bytes:
 	ret
 
 
-; r24             : (o)crc(junk)
+; r25             : (o)crc(junk)
 ; r23:r22:r21:r20 : (i)arg
 ; r19             : (o)return value(can be 0xFF for failed)
 ; r18             : (i)cmd(must use sdcmd(x)!)
@@ -703,9 +716,9 @@ send_256_dummy_bytes:
 ; assert: r1 = 0
 sd_cmd:
 	;load CRC
-	ldi r24, 0x95;assume cmd = 0
-	sbrc r18, 4;skip if cmd = 0
-	subi r24, (0x95-0x87);for cmd = 8, arg = 0x000001AA
+	ldi r25, 0x95;assume cmd = 0
+	sbrc r18, 3;skip if cmd = 0
+	subi r25, (0x95-0x87);for cmd = 8, arg = 0x000001AA
 	rcall spi_trans;cmd
 	mov r18, r23
 	rcall spi_trans;arg3
@@ -715,7 +728,7 @@ sd_cmd:
 	rcall spi_trans;arg1
 	mov r18, r20
 	rcall spi_trans;arg0
-	mov r18, r24
+	mov r18, r25
 	rcall spi_trans;crc
 	ser r18;0xFF
 sd_cmd_wait:
@@ -762,7 +775,7 @@ sd_readsect:
 	movw ZH:ZL, r25:r24
 sd_readsect_use_Z:
 	movw r27:r26, r19:r18
-	sbrs r14, 0;if use_blk_addr then * 512
+	sbrc r14, 0;if !use_blk_addr then * 512
 	rjmp sd_readsect_send;else skip
 	clc
 	rol r20
@@ -777,10 +790,12 @@ sd_readsect_send:
 	rcall sd_cmd;arg = address
 	cpse r19, r1;if r19(ret) = r1 (= 0) then skip
 	rjmp ret_1;else ret 1
+	;max ~100ms timeout
+	ldi r25, 128
 sd_readsect_cmd_loop:
 	rcall spi_trans
-	inc r1
-	breq ret_1_1;r1 = 0(256), fail(timeout)
+	sbiw r25:r24, 1
+	breq ret_1_1;if r25:r24 = 0, fail(timeout)
 	sbrc r19, 0;if bit0 = 0 then OK
 	rjmp sd_readsect_cmd_loop
 	;OK
@@ -831,7 +846,7 @@ ret_0:
 
 
 getnextsect_isroot:
-	adiw YH:YL, 12;Y -> RootDirEnd
+	adiw YH:YL, 8;Y -> RootDirEnd
 	clr ZH
 	ldi ZL, 10;Z -> r10
 	cp r0, r0;clear C, set Z
@@ -841,7 +856,7 @@ getnextsect_isroot:
 
 ; ZH:ZL    : (i)used (= 24)
 ; YH:YL    : (i)pointer to FSINFO
-;            (o)pointer to FSINFO + 12(or garbage)
+;            (o)pointer to FSINFO + 16(or garbage)
 ; r13::r10 : (i)thissect
 ;            (o)nextsect
 ; r9       : (i)SectPerClus - 1(bitmask)
@@ -868,10 +883,10 @@ getnextsect:
 	;SectOffset = (ClusterID << (FAT32 ? 2 : 1)) % 512
 	;FATSect = FATSect0 + (ClusterID / (FAT32 ? 128 : 256))
 	;load clus0pos
-	ldd r20, Y+8
-	ldd r21, Y+8+1
-	ldd r22, Y+8+2
-	ldd r23, Y+8+3
+	ldd r20, Y+12
+	ldd r21, Y+12+1
+	ldd r22, Y+12+2
+	ldd r23, Y+12+3
 	;0-clus0pos-1 (= 0xFFFFFFFF - xxx)
 	com r20
 	com r21
@@ -930,16 +945,17 @@ cls_to_sect:
 	;next sector = Clus0Sect + ClusID * SectPerClus
 	mov r1, r9
 	;lsl
+	sbrc r1, 0;if r1.0 = 0, then assume r1 = 0
 getnextsect_lsl_loop:
 	rcall lsl_r20
 	lsr r1
 	brne getnextsect_lsl_loop
 	;add clus0sect
-	adiw YH:YL, 4;Y -> Clus0Sect
+	adiw YH:YL, 8;Y -> Clus0Sect
 	rcall add_r20_Y
 	;done!
 	movw r13:r12, r23:r22
-	movw r13:r12, r23:r22
+	movw r11:r10, r21:r20
 	ret
 
 

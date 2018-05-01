@@ -90,5 +90,13 @@
       <SubType>Code</SubType>
     </Compile>
   </ItemGroup>
+  <ItemGroup>
+    <None Include="bootman.c">
+      <SubType>Code</SubType>
+    </None>
+    <None Include="bootman.h">
+      <SubType>Code</SubType>
+    </None>
+  </ItemGroup>
   <Import Project="$(AVRSTUDIO_EXE_PATH)\\Vs\\Assembler.targets" />
 </Project>

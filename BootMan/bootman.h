@@ -4,17 +4,44 @@
 #include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
-#else
-#include <stdbool.h>
+#endif
+
+#ifndef bool
+#define bool uint8_t
 #endif
 
 #define BOOTLOADER_FUNCTION_LIST 0x3810
 
-#define flash_file (*((uint8_t(*)(const char *filename))                  (BOOTLOADER_FUNCTION_LIST)))
-#define flash_page (*((bool   (*)(const uint8_t data[128], uint16_t addr))(BOOTLOADER_FUNCTION_LIST + 2)))
-#define sd_init    (*((uint8_t(*)(void))                                  (BOOTLOADER_FUNCTION_LIST + 4)))
+#pragma pack(push)
+#pragma pack(1)
 
-#undef BOOTLOADER_FUNCTION_LIST
+typedef struct tagFSINFO {
+	uint32_t FATPos;
+	uint32_t EntryPos;
+	uint32_t RootDirEnd;
+	uint32_t Clus0Pos;
+	uint8_t SecPerClus;
+	uint8_t FatType;
+} FSINFO;
+
+typedef struct tagFSINFO_EX {
+	FSINFO fsinfo;
+	uint8_t UseBlockAddress;
+} FSINFO_EX;
+
+typedef struct tagFILEINFO {
+	uint32_t StartSector;
+	uint32_t Length;
+} FILEINFO;
+
+#pragma pack(pop)
+
+extern uint8_t(*flash_file)(const char *filename);
+extern bool(*flash_page)(const uint8_t data[128], uint16_t addr);
+extern uint8_t(*sd_init)(void);
+extern uint8_t(*sd_readsect)(uint8_t *buffer, uint32_t sect, uint16_t start_byte, uint16_t byte_count, uint8_t use_block_address);
+extern uint8_t(*getfsinfo)(uint8_t use_block_index, FSINFO *fsinfo);
+extern FILEINFO(*findfile)(const char *filename, const FSINFO_EX *info);
 
 #ifdef __cplusplus
 }
