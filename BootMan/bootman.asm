@@ -326,8 +326,8 @@ getfsinfo_pop:
 	ret
 
 
-.def temp1 = r19
-.def temp2 = r18
+.def temp1 = r0
+.def temp2 = r25
 add_r20_Y:
 	ldi XL, 20
 	clr XH
@@ -936,7 +936,7 @@ getnextsect:
 	cpc r21, r18;r18 = 0xFF
 	sbrc r16, 4;FAT16 then skip
 	cpc r22, r18
-	andi r18, 0x0F
+	ldi r18, 0x0F
 	sbrc r16, 4
 	cpc r23, r18
 	brsh ret_1;r23::r20 >= 0x0FFFFFF8 or 0xFFF8
