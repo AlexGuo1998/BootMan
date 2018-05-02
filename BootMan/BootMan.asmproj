@@ -83,6 +83,9 @@
     </ToolchainSettings>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="5x3font.inc">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="arduman.inc">
       <SubType>Code</SubType>
     </Compile>
