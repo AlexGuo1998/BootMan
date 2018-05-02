@@ -15,18 +15,22 @@
 #define FINDFILE_WORKING_AREA    32
 
 .org BL_START
-/*
 	jmp bl
 
 .org VECTOR_START
 ;TODO re-arrange vector, re-define address
-entry_flash_file:
-	jmp flash_file
-entry_flash_page:
-	jmp flash_page
+entry_flashfile:
+	jmp flashfile
+entry_flashpage:
+	jmp flashpage
 entry_sdinit:
 	jmp sdinit
-*/
+entry_sdreadsect:
+	jmp sdreadsect
+entry_getfsinfo:
+	jmp getfsinfo
+entry_findfile:
+	jmp findfile
 
 ;normal boot sequence
 bl:
@@ -36,28 +40,34 @@ bl:
 	ldi r28, LOW(RAMEND)
 	out SPH, r29
 	out SPL, r30
+	;TODO stop WDT?
 	;TODO check button, flash "LOADER  BIN" automatically(?)
 	;or game select menu(?)
 
 	;TODO fill "LOADER  BIN"
-	rcall flash_file
+	;rcall flashfile
 start_app:
+jmp_0:
 	jmp 0
 
 
 ; flash a binary file
-; uint8_t flash_file(char *filename);
+; uint8_t flashfile(char *filename);
 ; r25:r24 = (i)filename pointer(paddled SFN, ex: "FOLDER1    NEWGAME BIN\0")
 ;     r24 = (o)errnumber (when OK, there's no return)
 ; TODO: more regs used...
-flash_file:
+flashfile:
+	in r0, SREG
+	cli
+	push r0
+
 	;don't do test for illegal filename(or length), to save code
 	;beacuse illegal filename will fail when going through dirs
 	push r25
 	push r24
 	rcall sdinit
 	sbrc r24, 7;r24 < 0x80 = OK
-	rjmp flash_file_error_1;else ret r24
+	rjmp flashfile_error_1;else ret r24
 	lsr r24
 	;push r24 + preserve opertion area
 	ldi r20, FSINFO_SIZE + 1
@@ -76,7 +86,7 @@ flashfile_push:
 	;now, r23:r22 = FSINFO = stack_top + 1
 	rcall getfsinfo
 	sbrc r24, 0;r24 = 0 = OK
-	rjmp flash_file_error_2;else err, ret r24
+	rjmp flashfile_error_2;else err, ret r24
 	;findfile
 	in ZH, SPH
 	in ZL, SPL
@@ -85,29 +95,107 @@ flashfile_push:
 	ldd r25, Z+18+1+1;r25:r24 -> filename
 	movw r23:r22, ZH:ZL;FSINFO_1
 	rcall findfile
-	;check filelen(r25::r22), if filelen = 0, hit on a dir or empty file
-	adiw r25:r24, 0
-	cpc r23, r1
-	cpc r22, r1
-	breq flash_file_error_2;file_len = 0
 	;check fileaddr(r21::r18), if fileaddr = 0, err happened
-	cp r21, r1
-	cpc r20, r1
+	cp r18, r1
 	cpc r19, r1
-	cpc r18, r1
-	breq flash_file_error_2;file_addr = 0
+	cpc r20, r1
+	cpc r21, r1
+	breq flashfile_error_2;file_addr = 0
+	;check filelen(r25::r22), if filelen = 0, hit on a dir or empty file
+	;filelen = min(filelen, BL_START * 2)
+	adiw r25:r24, 0
+	brne flashfile_gt; Filelen > maxfilelen
+	cp r22, r1
+	cpc r23, r1
+	breq flashfile_error_2;file_len = 0
+	;else: high 2 bytes are 0, if file_len[1] >= HIGH(BL_START * 2), then file > max
+	cpi r23, HIGH(BL_START * 2)
+	brlo flashfile_lt
+flashfile_gt:
+	;set file size to max
+	;don't care r25:r24
+	ldi r23, HIGH(BL_START * 2)
+	clr r22
+flashfile_lt:
 	;all check passed
-	;TODO readfile and flash
+	;because there's no way back, all regs are free to use
+	;readfile and flash
+	in YH, SPH
+	in YL, SPL
+	adiw YH:YL, 1;Y -> FSINFO_1
+	rcall load_r14r9r8
+	movw r7:r6, YH:YL
+	;raise stack 128B
+	ldi r20, 128
+flashfile_push_2:
+	push r24
+	dec r20
+	brne flashfile_push_2
+	movw r13:r12, r21:r20
+	movw r11:r10, r19:r18
+	movw r7:r6, r23:r22;file size
+	clr r15;byte offset, 1<<n
+	inc r15;r15 = 1
+flashfile_loop_reload:
+	clr r17
+	ldi r16, 128;byte count
+	;r23::r20 : sector id(can use for temp)
+	;r19:r18  : byte offset(re-loaded each time, can use for temp)
+	;r17:r16  : byte count(128)
+	;r15      : byte offset
+	;r14      : .0=use_blk_addr .4=FAT32
+	;r13::r10 : sector id(backup)
+	;r9       : SectPerClus - 1(bit mask)
+	;r8       : cluster bondary
+	;r7:r6    : file size
+	;r5:r4    : now page
 
-flash_file_error_2:
+	;flash now
+flashfile_loop:
+	in ZH, SPH
+	in ZL, SPL
+	adiw ZH:ZL, 1;Z -> buffer
+	mov r18, r15
+	clr r19
+	lsl r18
+	rol r19;r19:r18 = r15 << 1
+	rcall sdreadsect_use_Z
+	;now Z -> buffer[128]
+	sub ZL, r16;= 128
+	sbc ZH, r1
+	movw XH:XL, ZH:ZL
+	movw ZH:ZL, r5:r4
+	rcall flashpage_use_XZ_as_pointer
+	;now X -> buffer[128] (= FSINFO)
+	add r4, r16
+	adc r5, r1;r5:r4 + 128
+	cp r4, r6
+	cpc r5, r7
+	brsh flashfile_end;r5:r4 >= r7:r6 then end
+	lsl r15
+	brhc flashfile_loop;if not half-carry, loop
+	;else get next sect
+	swap r15;r15 = 1
+	movw YH:YL, XH:XL
+	rcall getnextsect
+	sbrs r24, 0;if ret != 0 then skip(go end)
+	;else ret = 0, loop
+	rjmp flashfile_loop_reload
+flashfile_end:
+	;jmp 0
+	rjmp jmp_0
+
+flashfile_error_2:
 	ldi r25, FSINFO_SIZE + 1
-flash_file_pop:
+flashfile_pop:
 	pop r0
 	dec r25
-	brne flash_file_pop
-flash_file_error_1:
-	pop r25;FN LOW
-	pop r25;FN HIGH
+	brne flashfile_pop
+flashfile_error_1:
+	pop r0;FN LOW
+	pop r0;FN HIGH
+	pop r0;SREG
+	out SREG, r0
 	ret
 
 
@@ -155,7 +243,7 @@ getfsinfo_push:
 	movw r19:r18, r21:r20;start byte = 0
 	clr r17
 	ldi r16, 1;byte_count = 1
-	rcall sd_readsect_use_Z
+	rcall sdreadsect_use_Z
 	sbrc r24, 0;if r24 = 0 then OK
 	rjmp getfsinfo_err;else err
 	ld r18, -Z
@@ -170,7 +258,7 @@ getfsinfo_push:
 	ldi r19, HIGH(454);start_byte = 454
 	;r17 should be 0
 	ldi r16, 4;byte_count = 4
-	rcall sd_readsect_use_Z;Z = &buffer[4]
+	rcall sdreadsect_use_Z;Z = &buffer[4]
 	sbrc r24, 0;if r24 = 0 then OK
 	rjmp getfsinfo_err;else err
 	;1st partition sector to r23::r20
@@ -188,7 +276,7 @@ getfsinfo_raw_fat:
 	ldi r18, 13
 	;r17 should be 0
 	ldi r16, 35
-	rcall sd_readsect_use_Z
+	rcall sdreadsect_use_Z
 	;r22::r20 is INVALID
 	sbrc r24, 0;if r24 = 0 then OK
 	rjmp getfsinfo_err;else err
@@ -354,6 +442,19 @@ st_Y_r20:
 	std Y+3, r23
 	ret
 
+load_r14r9r8:
+	;r14(0) = use_block_addr ? 1 : 0 (?)
+	;r14(4) = FAT32 ? 1 : 0 (?)
+	ldd r14, Y+17; = FAT_type
+	swap r14
+	ldd r0, Y+18; = use_block_addr
+	or r14, r0
+	;load r9(SectPerClus - 1), r8(ClusBondary)
+	ldd r9, Y+16
+	dec r9
+	ldd r8, Y+12;Clus0Pos low
+	and r8, r9;mask high bits
+	ret
 
 ; FSINFO_1(19) : FSINFO(18) + use_block_index(1)
 ; FILEINFO findfile(char *filename, FSINFO_1 *info)
@@ -398,12 +499,7 @@ findfile_push:
 	;saved r17::r4
 	;working area(32B)
 	movw YH:YL, r23:r22;Y -> FSINFO_1
-	;r14(0) = use_block_addr ? 1 : 0 (?)
-	;r14(4) = FAT32 ? 1 : 0 (?)
-	ldd r14, Y+17; = FAT_type
-	swap r14
-	ldd r0, Y+18; = use_block_addr
-	or r14, r0
+	rcall load_r14r9r8
 	;T = !(FAT16 && rootdir)
 	bst r14, 4
 	;infomation we should keep: now sector(r13::r10)? which item in dir(r15)?
@@ -413,11 +509,6 @@ findfile_push:
 	ldd r11, Y+5
 	ldd r12, Y+6
 	ldd r13, Y+7
-	;load r9(SectPerClus - 1), r8(ClusBondary)
-	ldd r9, Y+16
-	dec r9
-	ldd r8, Y+12;Clus0Pos low
-	and r8, r9;mask high bits
 	movw YH:YL, r25:r24;Y -> filename
 	;r17:r16 = 32(0x20)(read 32 bytes)
 	clr r17;TODO reload r17?
@@ -437,7 +528,7 @@ findfile_readentry:
 	movw r23:r22, r13:r12
 	movw r21:r20, r11:r10
 	;read file entry
-	rcall sd_readsect_use_Z
+	rcall sdreadsect_use_Z
 	sbrc r24, 0;if r24 = 0 then OK
 	rjmp findfile_err;else err
 	;now Z = &dir[32]
@@ -756,7 +847,7 @@ spi_trans_wait:
 	ret
 
 
-; uint8_t sd_readsect(uint8_t *buffer, uint32_t sect_index, uint16_t start_byte, uint16_t count, uint8_t block_address)
+; uint8_t sdreadsect(uint8_t *buffer, uint32_t sect_index, uint16_t start_byte, uint16_t count, uint8_t block_address)
 ; ZH:ZL           : (o)pointer to buffer(final)
 ; r27:r26         : (o)0 if OK, else UNDEF
 ; r25:r24         : (i)pointer to buffer(moved to ZH:ZL)
@@ -769,14 +860,12 @@ spi_trans_wait:
 ;     r18         : (o)0xFF
 ; r17:r16         : (i)byte count
 ; r14             : (i)use_block_addr ? xxxxxxx1 : xxxxxxx0 (not use -> addr must * 512)
-; r1              : (i)0 (if r1 != 0, false timeout can happen)
-;                   (o)0
-sd_readsect:
+sdreadsect:
 	movw ZH:ZL, r25:r24
-sd_readsect_use_Z:
+sdreadsect_use_Z:
 	movw r27:r26, r19:r18
 	sbrc r14, 0;if !use_blk_addr then * 512
-	rjmp sd_readsect_send;else skip
+	rjmp sdreadsect_send;else skip
 	clc
 	rol r20
 	rol r21
@@ -785,21 +874,20 @@ sd_readsect_use_Z:
 	mov r22, r21
 	mov r21, r20
 	clr r20
-sd_readsect_send:
+sdreadsect_send:
 	ldi r18, sdcmd(17);CMD17
 	rcall sd_cmd;arg = address
 	cpse r19, r1;if r19(ret) = r1 (= 0) then skip
 	rjmp ret_1;else ret 1
 	;max ~100ms timeout
 	ldi r25, 128
-sd_readsect_cmd_loop:
+sdreadsect_cmd_loop:
 	rcall spi_trans
 	sbiw r25:r24, 1
 	breq ret_1_1;if r25:r24 = 0, fail(timeout)
 	sbrc r19, 0;if bit0 = 0 then OK
-	rjmp sd_readsect_cmd_loop
+	rjmp sdreadsect_cmd_loop
 	;OK
-	clr r1;reset r1
 	sbrs r19, 7;if bit7 = 1 then OK
 ret_1_1:
 	rjmp ret_1;else fail
@@ -815,30 +903,30 @@ ret_1_1:
 	;now get data
 	;drop (start_byte) data
 	adiw r27:r26, 0;add 0 to test
-	breq sd_readsect_drop_1_skip;if 0 then skip
-sd_readsect_drop_1:
+	breq sdreadsect_drop_1_skip;if 0 then skip
+sdreadsect_drop_1:
 	rcall spi_trans
 	sbiw r27:r26, 1
-	brne sd_readsect_drop_1
-sd_readsect_drop_1_skip:
+	brne sdreadsect_drop_1
+sdreadsect_drop_1_skip:
 	;fill to buffer
 	movw r27:r26, r17:r16
 	adiw r27:r26, 0;add 0 to test
-	breq sd_readsect_receive_skip;if 0 then skip
-sd_readsect_receive:
+	breq sdreadsect_receive_skip;if 0 then skip
+sdreadsect_receive:
 	rcall spi_trans
 	st Z+, r19
 	sbiw r27:r26, 1
-	brne sd_readsect_receive
-sd_readsect_receive_skip:
+	brne sdreadsect_receive
+sdreadsect_receive_skip:
 	;drop remaining data
 	adiw r25:r24, 0;add 0 to test
-	breq sd_readsect_drop_2_skip;if 0 then skip
-sd_readsect_drop_2:
+	breq sdreadsect_drop_2_skip;if 0 then skip
+sdreadsect_drop_2:
 	rcall spi_trans
 	sbiw r25:r24, 1
-	brne sd_readsect_drop_2
-sd_readsect_drop_2_skip:
+	brne sdreadsect_drop_2
+sdreadsect_drop_2_skip:
 	;done, ret 0
 ret_0:
 	clr r24
@@ -856,7 +944,13 @@ getnextsect_isroot:
 
 ; ZH:ZL    : (i)used (= 24)
 ; YH:YL    : (i)pointer to FSINFO
-;            (o)pointer to FSINFO + 16(or garbage)
+;            (o)pointer to FSINFO + 16 for noroot
+;                       or FSINFO + 12 for rootdir
+;                       or garbage if error
+; r24      : (o)OK? 0 : 1
+; r23::r20 : (o)nextsect
+; r19:r18  : (o)used
+; r14      : (i).4 = FAT32? .0 = UseBlkIndex?
 ; r13::r10 : (i)thissect
 ;            (o)nextsect
 ; r9       : (i)SectPerClus - 1(bitmask)
@@ -864,7 +958,7 @@ getnextsect_isroot:
 getnextsect_noroot:
 	;for real files, not root dir
 	;will overwrite T
-	;TODO ?
+	;TODO needed?
 	set
 getnextsect:
 	;inc thissect
@@ -925,7 +1019,7 @@ getnextsect:
 	clr ZH
 	ldi ZL, 20;Z -> r20
 	;read FAT
-	rcall sd_readsect_use_Z
+	rcall sdreadsect_use_Z
 	sbrc r24, 0;if r24 = 0 then OK
 	ret;ret r24
 	andi r23, 0x0F;mask unused bits
@@ -960,7 +1054,7 @@ getnextsect_lsl_loop:
 
 
 ; flash a page(64 words/128 bytes) from RAM
-; bool flash_page(const uint8_t data[128], uint16_t addr)
+; bool flashpage(const uint8_t data[128], uint16_t addr)
 ; ZH:ZL   : (o)page address
 ; XH:XL   : (o)data pointer + 128
 ; r25:r24 : (i)data pointer
@@ -970,7 +1064,7 @@ getnextsect_lsl_loop:
 ; r18     : (o)sreg
 ; r1      : (o)0(always 0)
 ; r0      : (o)last low_byte(junk)
-flash_page:
+flashpage:
 	;preserve BL section (addr >= BL_START -> ret false)
 	cpi r23, HIGH(BL_START)
 	brlo flashpage_checkok;if HIGH(addr) < HIGH(bootloader) then OK
