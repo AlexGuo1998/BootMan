@@ -134,6 +134,9 @@ flashfile_push_2:
 	movw r13:r12, r21:r20
 	movw r11:r10, r19:r18
 	movw r7:r6, r23:r22;file size
+	clr r5
+	clr r4;TODO
+	movw r19:r18, r5:r4
 	clr r15;byte offset, 1<<n
 	inc r15;r15 = 1
 flashfile_loop_reload:
@@ -155,10 +158,10 @@ flashfile_loop:
 	in ZH, SPH
 	in ZL, SPL
 	adiw ZH:ZL, 1;Z -> buffer
-	mov r18, r15
-	clr r19
-	lsl r18
-	rol r19;r19:r18 = r15 << 1
+	movw r19:r18, r5:r4
+	andi r19, 0x01;r19:18 = page addr
+	movw r23:r22, r13:r12
+	movw r21:r20, r11:r10;file sector
 	rcall sdreadsect_use_Z
 	;now Z -> buffer[128]
 	sub ZL, r16;= 128
@@ -683,17 +686,10 @@ mul_X_1:
 .undef temp
 .undef carry
 
-
-; init SD card
-; uint8_t sdinit(void)
-; r24            : (o)cardmode (0=SD1, 1=SD2, 2=SDHC/SDXC(block index), 0xFF=failed)
-; r18~r23 r26~27 : (o)
-; T(flag)        : (o)0=SD1, 1=SD2/SDHC/SDXC
-; assert: r1 = 0
-sdinit:
-	ser r24;assume ret = 0xFF
-	clt;assume sdver = SD1(t=0)
-	;0.init SPI, set MISO to pullup
+; void spiinit(void)
+; r1  : (i)0
+; r18 : (o)(1<<SPE) | (1<<MSTR) = 0b0101_0000
+spiinit:
 	;set ss to OUTPUT
 	sbi SS_DDR, SS_BIT
 	;set MISO to pullup
@@ -716,6 +712,19 @@ sdinit:
 	;TODO enable 2x?
 	;ldi r18, (1<<SPI2X)
 	out SPSR, r1
+	ret
+
+; init SD card
+; uint8_t sdinit(void)
+; r24            : (o)cardmode (0=SD1, 1=SD2, 2=SDHC/SDXC(block index), 0xFF=failed)
+; r18~r23 r26~27 : (o)
+; T(flag)        : (o)0=SD1, 1=SD2/SDHC/SDXC
+; assert: r1 = 0
+sdinit:
+	ser r24;assume ret = 0xFF
+	clt;assume sdver = SD1(t=0)
+	;0.init SPI, set MISO to pullup
+	rcall spiinit
 
 	;1.set cs high, then apply 74+(10B+) dummy clocks
 	ser r18
@@ -799,12 +808,11 @@ send_256_dummy_bytes:
 	ret
 
 
-; r25             : (o)crc(junk)
+; r25             : (o)(junk)
 ; r23:r22:r21:r20 : (i)arg
 ; r19             : (o)return value(can be 0xFF for failed)
 ; r18             : (i)cmd(must use sdcmd(x)!)
 ;                   (o)0xFF
-; assert: r1 = 0
 sd_cmd:
 	;load CRC
 	ldi r25, 0x95;assume cmd = 0
@@ -824,12 +832,11 @@ sd_cmd:
 	ser r18;0xFF
 sd_cmd_wait:
 	rcall spi_trans
-	inc r1
-	breq sd_cmd_fail;r1 = 0(256), fail(timeout)
+	dec r25
+	breq sd_cmd_fail;r25 = 0(135+ clks), fail(timeout)
 	sbrc r19, 7;if bit7 = 0 then OK
 	rjmp sd_cmd_wait
 	;OK
-	clr r1;reset r1
 sd_cmd_fail:
 	ret
 
