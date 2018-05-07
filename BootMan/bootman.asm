@@ -727,27 +727,16 @@ spiinit:
 	out SPSR, r1
 	ret
 
-; init SD card
-; uint8_t sdinit(void)
-sdinit:
-	ser r24;assume ret = 0xFF
-	clt;assume sdver = SD1(t=0)
-	;0.init SPI, set MISO to pullup
-	rcall spiinit
-
-; XH:XL   : (o)(counter random junk)
 ; r25     : (o)(random junk)
-; r24     : (o)cardmode (0=SD1, 1=SD2, 2=SDHC/SDXC(block index), 0xFF=failed)
 ; r23:r22 : (o)0
-; r21:r20 : (o)0x0200
-; r19     : (o)(possibly 0x00)
+; r21:r20 : (o)0
+; r19     : (o)possbly 0x01 for normal card, 0xFF for no card
 ; r18     : (o)0xFF
 ; r1      : (i)0
-; T(flag) : (o)0=SD1, 1=SD2/SDHC/SDXC
+sd_gospimode:
 	;1.set cs high, then apply 74+(10B+) dummy clocks
 	ser r18
 	rcall send_256_dummy_bytes
-
 	;2.set cs low, issue CMD0(+CRC)
 	;CS = LOW
 	cbi SDCS_PORT, SDCS_BIT
@@ -757,6 +746,28 @@ sdinit:
 	clr r21
 	movw r23:r22, r21:r20
 	rcall sd_cmd
+	ret
+
+
+; init SD card
+; uint8_t sdinit(void)
+; XH:XL   : (o)(counter random junk)
+; r25     : (o)(random junk)
+; r24     : (o)cardmode (0=SD1, 1=SD2, 2=SDHC/SDXC(block index), 0xFF=failed)
+; r23:r22 : (o)0
+; r21:r20 : (o)0x0200
+; r19     : (o)(possibly 0x00)
+; r18     : (o)0xFF
+; r1      : (i)0
+; T(flag) : (o)0=SD1, 1=SD2/SDHC/SDXC
+sdinit:
+	;0.init SPI, set MISO to pullup
+	rcall spiinit
+	;TODO
+sdinit_nospi:
+	rcall sd_gospimode
+	ser r24;assume ret = 0xFF
+
 	;if ret != 0x01 then failed
 	cpi r19, 0x01
 	brne sdinit_end
@@ -770,8 +781,9 @@ sdinit:
 	sbrc r19, 7
 	rjmp sdinit_end;TODO direct ret?
 	;if ret = 0b0xxxx1xx then sdver1
-	sbrs r19, 2
-	set;else SD2, T=true
+	com r19;1's complement
+	;if ret = 0b1xxxx0xx then sdver1
+	bst r19, 2;0 = SD1
 
 	;4.issue CMD55+41, init(timeout 1s)
 	movw r21:r20, r23:r22;arg(1,2)=0
