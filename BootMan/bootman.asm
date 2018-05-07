@@ -36,10 +36,10 @@ entry_findfile:
 bl:
 	clr r1
 	out SREG, r1
-	ldi r29, HIGH(RAMEND)
-	ldi r28, LOW(RAMEND)
-	out SPH, r29
-	out SPL, r30
+	ldi YH, HIGH(RAMEND)
+	ldi YL, LOW(RAMEND)
+	out SPH, YH
+	out SPL, YL
 	;TODO stop WDT?
 	;TODO check button, flash "LOADER  BIN" automatically(?)
 	;or game select menu(?)
@@ -210,7 +210,8 @@ flashfile_error_1:
 ; r25
 ; r21::r18
 ; r23:r22 : (i)FSINFO addr
-; **********************************************************
+; r1 : (i)0
+; ****************************************
 ; FSINFO(18B)
 ; 0  uint32_t FATPos(when FAT starts?)
 ; 4  uint32_t EntryPos
@@ -464,8 +465,8 @@ load_r14r9r8:
 ; r25:r24 : (i)filename pointer
 ; r23:r22 : (i)FSINFO addr
 ; TODO more regs used...
-; r26     : (o)FileAttr
-;*****************************************************
+; XL      : (o)FileAttr
+; ****************************************
 ; FILEINFO(8B)
 ;   fileaddr(4B)(sector Index)r21::r18
 ;   filelen(4B)(bytes)r25::r22
@@ -610,8 +611,8 @@ findfile_done:
 	ldd r22, Z+28+0
 	ldd r23, Z+28+1
 	ldd r24, Z+28+2
-	ldd r25, Z+28+3
-	ldd r26, Z+11
+	ldd r25, Z+28+3;file length
+	ldd XL, Z+11;TODO file attr needed?
 findfile_pop:
 	ldi ZH, FINDFILE_WORKING_AREA
 findfile_pop_1:
@@ -632,6 +633,8 @@ findfile_pop_2:
 	ret
 
 
+; lsr r23::r20 for log2(r1 + 1) bits
+; (r23::r20 >> 1, r1 >> 1 while r1 != 0)
 loop_lsr_r20_r1:
 	lsr r23
 	ror r22
@@ -642,6 +645,8 @@ loop_lsr_r20_r1:
 	ret
 
 
+; lsl r23::r20
+; (r23::r20 << 1)
 lsl_r20:
 	lsl r20
 	rol r21
@@ -650,6 +655,13 @@ lsl_r20:
 	ret
 
 
+;compare Y[n] *Z[n]
+; Y   : (i)pointer
+;       (o)pointer + n
+; Z   : (i)pointer
+;       (o)pointer + n
+; r19 : (o)Z[n-1]
+; r18 : (o)Y[n-1]
 comp_YZ_11:
 	cp r0, r0;clear C, set Z
 	rcall comp_YZ_1
@@ -668,10 +680,11 @@ comp_YZ_1:
 	ret
 
 
-; *X = *X * r18, r25 = carry
-; r0, r1, r24 used
 .def temp = r24
 .def carry = r25
+; *X = *X * r18, r25 = carry
+; r0, r1, r24 used
+; ***warning*** after calling, r1 can be other than 0!
 mul_X_4:
 	rcall mul_X_2
 mul_X_2:
@@ -716,16 +729,21 @@ spiinit:
 
 ; init SD card
 ; uint8_t sdinit(void)
-; r24            : (o)cardmode (0=SD1, 1=SD2, 2=SDHC/SDXC(block index), 0xFF=failed)
-; r18~r23 r26~27 : (o)
-; T(flag)        : (o)0=SD1, 1=SD2/SDHC/SDXC
-; assert: r1 = 0
 sdinit:
 	ser r24;assume ret = 0xFF
 	clt;assume sdver = SD1(t=0)
 	;0.init SPI, set MISO to pullup
 	rcall spiinit
 
+; XH:XL   : (o)(counter random junk)
+; r25     : (o)(random junk)
+; r24     : (o)cardmode (0=SD1, 1=SD2, 2=SDHC/SDXC(block index), 0xFF=failed)
+; r23:r22 : (o)0
+; r21:r20 : (o)0x0200
+; r19     : (o)(possibly 0x00)
+; r18     : (o)0xFF
+; r1      : (i)0
+; T(flag) : (o)0=SD1, 1=SD2/SDHC/SDXC
 	;1.set cs high, then apply 74+(10B+) dummy clocks
 	ser r18
 	rcall send_256_dummy_bytes
@@ -757,8 +775,7 @@ sdinit:
 
 	;4.issue CMD55+41, init(timeout 1s)
 	movw r21:r20, r23:r22;arg(1,2)=0
-	;movw r27:r26, r23:r22;delay counter = 0
-	ldi r27, 16;1048576+ Bytes @4MHz(3s+)
+	ldi XH, 16;1048576+ Bytes @4MHz(3s+)
 acmd41_loop:
 	rcall send_256_dummy_bytes ;drop cmd8 remaining bytes, also delay
 	ldi r18, sdcmd(55)
@@ -768,7 +785,7 @@ acmd41_loop:
 	bld r23, 6;if SD2(T=1), arg = 0x4000_0000, else arg = 0
 	rcall sd_cmd
 	;test counter overflow
-	sbiw r27:r26, 1
+	sbiw XH:XL, 1
 	breq sdinit_end;0 = fail
 	sbrc r19, 0;if ret = 0x00(card ready) then exit loop
 	rjmp acmd41_loop;loop
@@ -799,8 +816,8 @@ sdinit_end:
 	ret
 
 
-; assert r18 = 0xFF
-; assert r1 = 0
+; r18 : (i)0xFF
+; r1  : (i)0
 send_256_dummy_bytes:
 	rcall spi_trans
 	inc r1
@@ -808,7 +825,7 @@ send_256_dummy_bytes:
 	ret
 
 
-; r25             : (o)(junk)
+; r25             : (o)(random junk)
 ; r23:r22:r21:r20 : (i)arg
 ; r19             : (o)return value(can be 0xFF for failed)
 ; r18             : (i)cmd(must use sdcmd(x)!)
@@ -856,13 +873,13 @@ spi_trans_wait:
 
 ; uint8_t sdreadsect(uint8_t *buffer, uint32_t sect_index, uint16_t start_byte, uint16_t count, uint8_t block_address)
 ; ZH:ZL           : (o)pointer to buffer(final)
-; r27:r26         : (o)0 if OK, else UNDEF
+; XH:XL           : (o)0 if OK, else UNDEF
 ; r25:r24         : (i)pointer to buffer(moved to ZH:ZL)
 ; r25             : (o)0 if OK, else UNDEF
 ;     r24         : (o)OK ? 0 : 1
 ; r23:r22:r21:r20 : (i)sector
 ;                   (o)sector or byte address
-; r19:r18         : (i)start byte(moved to r27:r26)
+; r19:r18         : (i)start byte(later moved to XH:XL)
 ; r19             : (o)out crc(last byte)
 ;     r18         : (o)0xFF
 ; r17:r16         : (i)byte count
@@ -870,7 +887,7 @@ spi_trans_wait:
 sdreadsect:
 	movw ZH:ZL, r25:r24
 sdreadsect_use_Z:
-	movw r27:r26, r19:r18
+	movw XH:XL, r19:r18
 	sbrc r14, 0;if !use_blk_addr then * 512
 	rjmp sdreadsect_send;else skip
 	clc
@@ -902,28 +919,28 @@ ret_1_1:
 	;calc remaining byte, save to r25:r24
 	ldi r25, 0x02
 	ldi r24, 0x02;0x0202(512+2), for dropping 2B CRC
-	sub r24, r26
-	sbc r25, r27;substract start byte
+	sub r24, XL
+	sbc r25, XH;substract start byte
 	sub r24, r16
 	sbc r25, r17;substract byte count
 
 	;now get data
 	;drop (start_byte) data
-	adiw r27:r26, 0;add 0 to test
+	adiw XH:XL, 0;add 0 to test
 	breq sdreadsect_drop_1_skip;if 0 then skip
 sdreadsect_drop_1:
 	rcall spi_trans
-	sbiw r27:r26, 1
+	sbiw XH:XL, 1
 	brne sdreadsect_drop_1
 sdreadsect_drop_1_skip:
 	;fill to buffer
-	movw r27:r26, r17:r16
-	adiw r27:r26, 0;add 0 to test
+	movw XH:XL, r17:r16
+	adiw XH:XL, 0;add 0 to test
 	breq sdreadsect_receive_skip;if 0 then skip
 sdreadsect_receive:
 	rcall spi_trans
 	st Z+, r19
-	sbiw r27:r26, 1
+	sbiw XH:XL, 1
 	brne sdreadsect_receive
 sdreadsect_receive_skip:
 	;drop remaining data
@@ -962,10 +979,11 @@ getnextsect_isroot:
 ;            (o)nextsect
 ; r9       : (i)SectPerClus - 1(bitmask)
 ; r8       : (i)cluster bondary
+; T(flag)  : (i)FAT16 && root ? 0 : 1
 getnextsect_noroot:
 	;for real files, not root dir
 	;will overwrite T
-	;TODO needed?
+	;TODO is this needed?
 	set
 getnextsect:
 	;inc thissect
