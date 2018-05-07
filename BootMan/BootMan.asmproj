@@ -69,6 +69,7 @@
     <OutputType>Executable</OutputType>
     <PostBuildEvent>
     </PostBuildEvent>
+    <PreBuildEvent>python "$(SolutionDir)docgen\docgen.py" "$(SolutionDir)BootMan\bootman.asm" "$(SolutionDir)BootMan\bootman-doc.inc"</PreBuildEvent>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Release' ">
     <ToolchainSettings>
@@ -87,6 +88,9 @@
       <SubType>Code</SubType>
     </Compile>
     <Compile Include="arduman.inc">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="bootman-doc.inc">
       <SubType>Code</SubType>
     </Compile>
     <Compile Include="bootman.asm">

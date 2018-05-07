@@ -263,3 +263,6 @@ __pycache__/
 # AtmelStudio component info
 *.componentinfo.xml
 
+# Generated doc
+*-doc.inc
+
