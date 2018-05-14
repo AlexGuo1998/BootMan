@@ -446,6 +446,10 @@ st_Y_r20:
 	std Y+3, r23
 	ret
 
+; YH:YL : (i)FSINFO_EX pointer
+; r14   : (o)FAT32, use_block_addr
+; r9    : SectPerClus - 1
+; r8    : ClusBondary
 load_r14r9r8:
 	;r14(0) = use_block_addr ? 1 : 0 (?)
 	;r14(4) = FAT32 ? 1 : 0 (?)
@@ -536,23 +540,24 @@ findfile_readentry:
 	sbrc r24, 0;if r24 = 0 then OK
 	rjmp findfile_err;else err
 	;now Z = &dir[32]
-	sbiw ZH:ZL, 32
+	sbiw ZH:ZL, 32-11
+	;now Z = &dir[11]
 	;compare YZ
-	rcall comp_YZ_11
+	rcall comp_YZ_11_add_Y
 	brne findfile_nextfile;if not EQ, find next
 	;else found
 	;check file_attr
-	ld r19, Z;r19 = attr
+	ldd r19, Z+11;r19 = attr
 	sbrc r19, 3;if attr & 0x08(is volume lbl) = 0 then skip
 	rjmp findfile_nextfile;else skip
-	ld r18, Y;filename[11]
+	ldd r18, Y+11;filename[11]
 	cpi r18, 0
 	breq findfile_found;filename done, OK
 	sbrs r19, 4;if this is a dir then skip(OK)
 	rjmp findfile_nextfile;else: want to find a dir, but hit on a file, failed
 	;TODO or jmp err?
 findfile_found:
-	sbiw ZH:ZL, 11;Z -> buffer[0]
+	adiw YH:YL, 11;Y += 11
 	set;not rootdir
 	;load new cluster id
 	ldd r20, Z+26
@@ -576,10 +581,6 @@ findfile_found:
 	brne findfile_newsect;filename not done then loop
 	rjmp findfile_done;done, jmp
 findfile_nextfile:
-	;restore buffer ptr(Z)
-	sbiw ZH:ZL, 11;Z -> buffer[0]
-	;restore filename ptr(Y)
-	sbiw YH:YL, 11
 	inc r15
 	sbrs r15, 4;half ovf
 	rjmp findfile_readentry;not overflow, go nextentry
@@ -655,27 +656,35 @@ lsl_r20:
 	ret
 
 
-;compare Y[n] *Z[n]
-; Y   : (i)pointer
-;       (o)pointer + n
-; Z   : (i)pointer
-;       (o)pointer + n
-; r19 : (o)Z[n-1]
-; r18 : (o)Y[n-1]
-comp_YZ_11:
+;compare Y[n] Z[n]
+; Y   : (i)pointer + n
+;       (o)pointer 
+; Z   : (i)pointer + n
+;       (o)pointer
+; r19 : (o)Z[0]
+; r18 : (o)Y[0]
+comp_YZ_11_add_Y:
+	;for fullname match
+	adiw YH:YL, 11
+comp_YZ_11_dec:
 	cp r0, r0;clear C, set Z
-	rcall comp_YZ_1
-comp_YZ_10:
-	rcall comp_YZ_2
-comp_YZ_8:
-	rcall comp_YZ_4
-comp_YZ_4:
-	rcall comp_YZ_2
-comp_YZ_2:
-	rcall comp_YZ_1
-comp_YZ_1:
-	ld r18, Y+
-	ld r19, Z+
+	rcall comp_YZ_1_dec
+comp_YZ_10_dec:
+	rcall comp_YZ_5_dec
+comp_YZ_5_dec:
+	;for shorten filename compare
+	rcall comp_YZ_1_dec
+comp_YZ_4_dec:
+	;for sect = rootdirend compare
+	rcall comp_YZ_1_dec
+comp_YZ_3_dec:
+	;for file ext match
+	rcall comp_YZ_1_dec
+comp_YZ_2_dec:
+	rcall comp_YZ_1_dec
+comp_YZ_1_dec:
+	ld r18, -Y
+	ld r19, -Z
 	cpc r18, r19
 	ret
 
@@ -970,18 +979,19 @@ ret_0:
 
 
 getnextsect_isroot:
-	adiw YH:YL, 8;Y -> RootDirEnd
+	adiw YH:YL, 8+4;Y -> RootDirEnd+4
 	clr ZH
-	ldi ZL, 10;Z -> r10
+	ldi ZL, 10+4;Z -> r(10+4)
 	cp r0, r0;clear C, set Z
-	rcall comp_YZ_4
+	rcall comp_YZ_4_dec
 	breq ret_1_1
 	rjmp ret_0
 
-; ZH:ZL    : (i)used (= 24)
+; ZH:ZL    : (o)24 for noroot
+;               or 10 for rootdir
 ; YH:YL    : (i)pointer to FSINFO
 ;            (o)pointer to FSINFO + 16 for noroot
-;                       or FSINFO + 12 for rootdir
+;                       or FSINFO + 8 for rootdir
 ;                       or garbage if error
 ; r24      : (o)OK? 0 : 1
 ; r23::r20 : (o)nextsect
