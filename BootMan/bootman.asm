@@ -1105,10 +1105,11 @@ getnextsect_lsl_loop:
 ; ZH:ZL   : (o)page address
 ; XH:XL   : (o)data pointer + 128
 ; r25:r24 : (i)data pointer
+; r25     : (o)sreg
 ;     r24 : (o)OK?1:0
 ; r23:r22 : (i)address (low 7 bits are ignored)
 ; r19     : (o)0(?)
-; r18     : (o)sreg
+; r18     : (o)(1<<SPMEN) | (1<<RWWSRE) (0b00010001)
 ; r1      : (o)0(always 0)
 ; r0      : (o)last low_byte(junk)
 flashpage:
@@ -1123,21 +1124,18 @@ flashpage_checkok:
 	movw XH:XL, r25:r24
 	movw ZH:ZL, r23:r22
 flashpage_use_XZ_as_pointer:
-	;lower Z = 0, for writing
-	andi ZL, 0b1000_0000
-	;save SREG and disable interrupt
-	;TODO use a temp reg to save SREG to avoid PUSH/POP?
-	in temp, SREG
+	;save SREG
+	in r25, SREG
+	;save high bit of ZL
+	bst ZL, 7
+	;Z = 10000000, for writing buffer
+	ldi ZL, 0x80
+	;disable interrupt
 	cli
-	push temp
 	;wait for eeprom write
 flashpage_wait_eeprom:
 	sbic EECR, EEPE
 	rjmp flashpage_wait_eeprom
-	;erase page
-	ldi temp, (1<<SPMEN) | (1<<PGERS)
-	rcall do_spm
-	ldi r25, 64;64 words
 	;load page buffer
 	ldi temp, (1<<SPMEN)
 flashpage_fill_buffer:
@@ -1145,10 +1143,13 @@ flashpage_fill_buffer:
 	ld r1, X+
 	rcall do_spm
 	subi ZL, -2;ZL += 2
-	dec r25
-	brne flashpage_fill_buffer;if r25 != 0 then loop
+	brne flashpage_fill_buffer;if ZL != 0 then loop
 	;else: all data (128b) loaded to buffer
-	subi ZL, 128;reset ZL
+	;reset high bit of ZL
+	bld ZL, 7
+	;erase page
+	ldi temp, (1<<SPMEN) | (1<<PGERS)
+	rcall do_spm
 	;write page
 	ldi temp, (1<<SPMEN) | (1<<PGWRT)
 	rcall do_spm
@@ -1157,8 +1158,7 @@ flashpage_fill_buffer:
 	rcall do_spm
 	;done, restore
 	clr r1
-	pop temp
-	out SREG, temp
+	out SREG, r25
 	;return 1(true)
 ret_1:
 	ldi r24, 1
